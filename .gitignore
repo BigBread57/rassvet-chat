@@ -1,0 +1,23 @@
+# Local IDE and Android build files
+.idea/
+.vscode/
+*.iml
+android/.gradle/
+android/.kotlin/
+**/build/
+android/local.properties
+*.log
+*.apk
+
+# Local service data and secrets
+*.db
+*.db-*
+*.pem
+*.key
+admin-ticket.json
+nodes.json
+service/rassvetd
+
+# Python cache
+__pycache__/
+*.pyc
