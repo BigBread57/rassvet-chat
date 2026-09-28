@@ -14,6 +14,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.BitmapFactory
@@ -21,9 +22,14 @@ import android.graphics.Bitmap
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.Manifest
 import android.net.Uri
 import android.database.Cursor
-import android.provider.DocumentsContract
+import android.media.MediaScannerConnection
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
@@ -50,7 +56,6 @@ import com.google.zxing.integration.android.IntentIntegrator
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -78,8 +83,8 @@ class MainActivity : ComponentActivity() {
     private var backAction: (() -> Unit)? = null
     private var pendingAttachmentRoom: Pair<String, String>? = null
     private var pendingAttachmentUri: Uri? = null
-    private var pendingSave: Triple<String, JSONObject, File>? = null
-    private var pendingSaveUri: Uri? = null
+    private var externalActivityPending = false
+    private var pendingStorageDownload: (() -> Unit)? = null
     private var pendingScannedTicket: String? = null
     private var pendingActivationImage: Uri? = null
     private val downloadedFiles = mutableListOf<File>()
@@ -107,14 +112,6 @@ class MainActivity : ComponentActivity() {
         pinLock = PinLock(this)
         devicePreferences = getSharedPreferences("device", MODE_PRIVATE)
         devicePreferences.registerOnSharedPreferenceChangeListener(activationListener)
-        val saveRoom = savedInstanceState?.getString("save_room")
-        val saveAttachment = savedInstanceState?.getString("save_attachment")
-        if (saveRoom != null && saveAttachment != null) {
-            runCatching { JSONObject(saveAttachment) }.onSuccess {
-                pendingSave = Triple(saveRoom, it, File(cacheDir, "download-unavailable.tmp"))
-            }
-        }
-        pendingSaveUri = savedInstanceState?.getString("save_uri")?.let(Uri::parse)
         val attachmentRoomID = savedInstanceState?.getString("attachment_room_id")
         val attachmentRoomName = savedInstanceState?.getString("attachment_room_name")
         if (attachmentRoomID != null && attachmentRoomName != null) {
@@ -160,24 +157,32 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         active = true
+        if (externalActivityPending) {
+            externalActivityPending = false
+            lockSession()
+        }
         if (!client.isActivated()) {
             showActivation()
             processScannedTicket()
             processActivationImage()
         } else if (!unlocked) {
             if (pinLock.isSet()) showUnlock() else showPinSetup()
-        }
+        } else if (pendingAttachmentUri != null) processPickedAttachment()
     }
 
     override fun onPause() {
         active = false
+        if (!externalActivityPending) lockSession()
+        super.onPause()
+    }
+
+    private fun lockSession() {
         backAction = null
         client.lock()
         unlocked = false
         screenVersion++
         clearScreen()
         clearDownloads()
-        super.onPause()
     }
 
     override fun onDestroy() {
@@ -186,11 +191,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        pendingSave?.let { (room, attachment, _) ->
-            outState.putString("save_room", room)
-            outState.putString("save_attachment", attachment.toString())
-        }
-        pendingSaveUri?.let { outState.putString("save_uri", it.toString()) }
         pendingAttachmentRoom?.let { (id, name) ->
             outState.putString("attachment_room_id", id)
             outState.putString("attachment_room_name", name)
@@ -201,6 +201,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        externalActivityPending = false
+        if (requestCode == 4) return
         if (requestCode == IntentIntegrator.REQUEST_CODE) {
             pendingScannedTicket = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)?.contents
             if (active) processScannedTicket()
@@ -211,17 +213,6 @@ class MainActivity : ComponentActivity() {
             if (active) processActivationImage()
             return
         }
-        if (requestCode == 2) {
-            if (resultCode == RESULT_OK && data?.data != null) {
-                pendingSaveUri = data.data
-                if (unlocked) processPickedSave()
-            } else {
-                pendingSave?.third?.delete()
-                pendingSave = null
-                pendingSaveUri = null
-            }
-            return
-        }
         if (requestCode != 1) return
         if (resultCode != RESULT_OK || data?.data == null) {
             pendingAttachmentRoom = null
@@ -230,6 +221,17 @@ class MainActivity : ComponentActivity() {
         }
         pendingAttachmentUri = data.data
         if (unlocked) processPickedAttachment()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>,
+                                            grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != 5) return
+        externalActivityPending = false
+        val retry = pendingStorageDownload
+        pendingStorageDownload = null
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED && unlocked) retry?.invoke()
+        else if (unlocked) showError("Для сохранения в Загрузки нужно разрешение на файлы")
     }
 
     private fun processScannedTicket() {
@@ -273,44 +275,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun processPickedSave() {
-        val (roomID, attachment, file) = pendingSave ?: return
-        val uri = pendingSaveUri ?: return
-        pendingSave = null
-        pendingSaveUri = null
-        showRooms()
-        text("Сохранение: ${attachment.getString("name")}")
-        runNetwork({
-            var source = file
-            try {
-                val rights = JSONObject(client.get("/v1/rooms/$roomID")).getJSONObject("rights")
-                check(rights.getBoolean("save_attachment")) { "Нет права сохранения" }
-                val expiresAt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
-                    timeZone = TimeZone.getTimeZone("UTC")
-                    isLenient = false
-                }.parse(attachment.getString("expires_at"))?.time ?: error("Неверный срок файла")
-                check(expiresAt > System.currentTimeMillis()) { "Срок файла истёк" }
-                if (!source.isFile) {
-                    source = File.createTempFile("download-", ".tmp", cacheDir)
-                    client.downloadAttachment(roomID, attachment.getString("id"), attachment.getLong("size"),
-                        attachment.getString("sha256"), source) {}
-                }
-                contentResolver.openOutputStream(uri, "w")?.use { output ->
-                    source.inputStream().use { it.copyTo(output) }
-                } ?: error("Не удалось открыть выбранное место")
-            } finally {
-                source.delete()
-                file.delete()
-            }
-        }) { result ->
-            result.onSuccess { text("Файл сохранён") }
-                .onFailure {
-                    runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }
-                    showError("Не удалось сохранить: ${it.message}")
-                }
-        }
-    }
-
     private fun processPickedAttachment() {
         val room = pendingAttachmentRoom ?: return
         val uri = pendingAttachmentUri ?: return
@@ -323,7 +287,6 @@ class MainActivity : ComponentActivity() {
             .filterNot { it == '\u0000' || it == '\r' || it == '\n' }.take(200)
             .let { if (it.isBlank() || it == "." || it == "..") "file" else it }
         val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-        text("Загрузка: $name")
         val attachmentID = Uuid7.new()
         runNetwork({
             val file = File.createTempFile("attachment-", ".tmp", cacheDir)
@@ -363,12 +326,14 @@ class MainActivity : ComponentActivity() {
         title("Подключить Рассвет")
         text("Получите код и адреса двух узлов у администратора.")
         button("Сканировать QR-код", primary = true) {
+            externalActivityPending = true
             IntentIntegrator(this).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
                 .setCaptureActivity(PortraitCaptureActivity::class.java)
                 .setPrompt("Наведите камеру на код активации")
                 .setBeepEnabled(false).initiateScan()
         }
         button("Загрузить фото QR-кода") {
+            externalActivityPending = true
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "image/*"
@@ -421,7 +386,6 @@ class MainActivity : ComponentActivity() {
             if (client.unlock(input.text.toString())) {
                 unlocked = true
                 when {
-                    pendingSaveUri != null -> processPickedSave()
                     pendingAttachmentUri != null -> processPickedAttachment()
                     else -> showRooms()
                 }
@@ -1038,9 +1002,10 @@ class MainActivity : ComponentActivity() {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 Handler(mainLooper).postDelayed({ file.delete() }, deadline - System.currentTimeMillis())
-                startActivity(Intent.createChooser(intent, "Поделиться QR-кодом").apply {
+                externalActivityPending = true
+                startActivityForResult(Intent.createChooser(intent, "Поделиться QR-кодом").apply {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                })
+                }, 4)
             } catch (error: Exception) {
                 file.delete()
                 throw error
@@ -1174,6 +1139,7 @@ class MainActivity : ComponentActivity() {
                                 ChatComposer(message, !sending, canSendText, canAttach,
                                     { message = it }, {
                                     pendingAttachmentRoom = id to name
+                                    externalActivityPending = true
                                     startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                                         type = "*/*"
                                         addCategory(Intent.CATEGORY_OPENABLE)
@@ -1551,8 +1517,10 @@ class MainActivity : ComponentActivity() {
             }
             if (prepend) parent.addView(row, insertAt++) else parent.addView(row)
             text("${attachment.getString("name")} (${attachment.getLong("size")} байт)", row)
-            button("Загрузить: ${attachment.getString("name")}", row) {
-                downloadAttachment(roomID, attachment, canSave, row)
+            lateinit var downloadButton: ComposeView
+            downloadButton = button("Загрузить: ${attachment.getString("name")}", row) {
+                downloadButton.visibility = android.view.View.GONE
+                downloadAttachment(roomID, attachment, canSave, row, downloadButton)
             }
             val expiryVersion = screenVersion
             expiryHandler.postDelayed({
@@ -1615,7 +1583,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadAttachment(roomID: String, attachment: JSONObject, canSave: Boolean,
-                                   parent: LinearLayout) {
+                                   parent: LinearLayout, downloadButton: ComposeView) {
+        if (canSave && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            downloadButton.visibility = android.view.View.VISIBLE
+            pendingStorageDownload = {
+                downloadButton.visibility = android.view.View.GONE
+                downloadAttachment(roomID, attachment, canSave, parent, downloadButton)
+            }
+            externalActivityPending = true
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 5)
+            return
+        }
         val expiresAt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
             isLenient = false
@@ -1643,6 +1622,12 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                    if (canSave) {
+                        val rights = JSONObject(client.get("/v1/rooms/$roomID")).getJSONObject("rights")
+                        check(rights.getBoolean("save_attachment")) { "Нет права сохранения" }
+                        check(expiresAt > System.currentTimeMillis()) { "Срок вложения истёк" }
+                        saveToDownloads(file, attachment.getString("name"), mimeType)
+                    }
                     file
                 } catch (error: Exception) {
                     file.delete()
@@ -1664,7 +1649,7 @@ class MainActivity : ComponentActivity() {
                             file.delete()
                             downloadedFiles.remove(file)
                         }, (expiresAt - System.currentTimeMillis()).coerceAtLeast(0))
-                        status.text = "Файл получен, целостность проверена"
+                        status.text = if (canSave) "Сохранено в Загрузки" else "Файл получен, целостность проверена"
                         if (mimeType.startsWith("image/")) {
                             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                             BitmapFactory.decodeFile(file.path, options)
@@ -1687,31 +1672,56 @@ class MainActivity : ComponentActivity() {
                                 expiryHandler.postDelayed({ it.stopPlayback(); videos.remove(it) },
                                     (expiresAt - System.currentTimeMillis()).coerceAtLeast(0))
                             }
-                        } else if (mimeType.startsWith("text/")) {
-                            val preview = ByteArray(minOf(file.length(), 64 * 1024L).toInt())
-                            val count = FileInputStream(file).use { it.read(preview) }
-                            if (count > 0) text(String(preview, 0, count, Charsets.UTF_8), parent)
                         }
-                        if (canSave) button("Сохранить: ${attachment.getString("name")}", parent) {
-                            downloadedFiles.remove(file)
-                            pendingSave = Triple(roomID, attachment, file)
-                            Handler(mainLooper).postDelayed({ file.delete() },
-                                (expiresAt - System.currentTimeMillis()).coerceAtLeast(0))
-                            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                                type = mimeType
-                                addCategory(Intent.CATEGORY_OPENABLE)
-                                putExtra(Intent.EXTRA_TITLE, attachment.getString("name"))
-                            }, 2)
-                        }
-                        if (canSave) button("Передать: ${attachment.getString("name")}", parent) {
+                        if (canSave) button("Передать", parent) {
                             shareAttachment(roomID, attachment, file)
                         }
                     }.onFailure {
                         status.text = "Ошибка загрузки: ${it.message}"
+                        downloadButton.visibility = android.view.View.VISIBLE
                     }
                 }
             }
         }.start()
+    }
+
+    private fun saveToDownloads(source: File, name: String, mimeType: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("Не удалось создать файл в Загрузках")
+            try {
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    source.inputStream().use { it.copyTo(output) }
+                } ?: error("Не удалось записать файл в Загрузки")
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                check(contentResolver.update(uri, values, null, null) == 1) { "Не удалось опубликовать файл" }
+            } catch (error: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw error
+            }
+        } else {
+            val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            check(directory.isDirectory || directory.mkdirs()) { "Каталог Загрузки недоступен" }
+            val stem = name.substringBeforeLast('.', name)
+            val extension = name.substringAfterLast('.', "").let { if (it.isEmpty()) "" else ".$it" }
+            var target = File(directory, name)
+            var copy = 1
+            while (!target.createNewFile()) target = File(directory, "$stem (${copy++})$extension")
+            try {
+                source.inputStream().use { input -> target.outputStream().use { input.copyTo(it) } }
+                MediaScannerConnection.scanFile(this, arrayOf(target.path), arrayOf(mimeType), null)
+            } catch (error: Exception) {
+                target.delete()
+                throw error
+            }
+        }
     }
 
     private fun shareAttachment(roomID: String, attachment: JSONObject, source: File) {
@@ -1749,9 +1759,10 @@ class MainActivity : ComponentActivity() {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 Handler(mainLooper).postDelayed({ file.delete() }, (deadline - System.currentTimeMillis()).coerceAtLeast(0))
-                startActivity(Intent.createChooser(intent, "Передать файл").apply {
+                externalActivityPending = true
+                startActivityForResult(Intent.createChooser(intent, "Передать файл").apply {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                })
+                }, 4)
             }.onFailure { showError("Не удалось передать: ${it.message}") }
         }
     }
@@ -1815,15 +1826,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun compose(parent: LinearLayout, fill: Boolean = false, horizontal: Boolean = false,
-                        body: @Composable () -> Unit) {
-        parent.addView(ComposeView(this).apply {
+                        body: @Composable () -> Unit): ComposeView {
+        return ComposeView(this).apply {
             if (android.os.Build.VERSION.SDK_INT >= 26)
                 importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             layoutParams = LinearLayout.LayoutParams(
                 if (horizontal) 0 else if (fill) -1 else -2, -2,
                 if (horizontal) 1f else 0f)
             setContent { ChatTheme(darkTheme, body) }
-        })
+        }.also(parent::addView)
     }
 
     private fun title(value: String) {
@@ -1843,9 +1854,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun button(label: String, parent: LinearLayout = content, primary: Boolean = false,
-                       action: () -> Unit) {
+                       action: () -> Unit): ComposeView {
         val horizontal = parent.orientation == LinearLayout.HORIZONTAL
-        compose(parent, fill = !horizontal, horizontal = horizontal) {
+        return compose(parent, fill = !horizontal, horizontal = horizontal) {
             ChatButton(label, horizontal, primary, action)
         }
     }
