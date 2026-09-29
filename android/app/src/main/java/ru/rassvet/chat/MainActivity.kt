@@ -103,7 +103,6 @@ class MainActivity : ComponentActivity() {
         darkTheme = getSharedPreferences("appearance", MODE_PRIVATE).getBoolean("dark_theme", true)
         setTheme(if (darkTheme) R.style.AppThemeDark else R.style.AppTheme)
         super.onCreate(savedInstanceState)
-        applySystemBars()
         // The acceptance test needs screenshots from the debug APK.
         if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -135,6 +134,7 @@ class MainActivity : ComponentActivity() {
             addView(footer)
         }
         setContentView(root)
+        applySystemBars()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 val action = backAction
