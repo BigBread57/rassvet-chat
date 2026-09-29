@@ -36,6 +36,12 @@ var filePublishMu sync.Mutex
 
 const absoluteMaxAttachmentBytes = 100 << 20
 
+func validAttachmentName(name string) bool {
+	return name != "" && name != "." && name != ".." && name != "/" &&
+		filepath.Base(strings.ReplaceAll(name, "\\", "/")) == name &&
+		len([]rune(name)) <= 200 && !strings.ContainsAny(name, "\x00\r\n")
+}
+
 func attachments(w http.ResponseWriter, r *http.Request, db *sql.DB, storageDir string) {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/rooms/"), "/")
 	if len(parts) < 2 || len(parts) > 3 || !validUUID(parts[0]) || parts[1] != "attachments" || (len(parts) == 3 && !validUUID(parts[2])) {
@@ -119,7 +125,7 @@ func putAttachment(w http.ResponseWriter, r *http.Request, db *sql.DB, dir strin
 		return
 	}
 	name := filepath.Base(strings.ReplaceAll(r.Header.Get("X-File-Name"), "\\", "/"))
-	if name == "." || name == ".." || name == "/" || name == "" || len([]rune(name)) > 200 || strings.ContainsAny(name, "\x00\r\n") {
+	if !validAttachmentName(name) {
 		errorJSON(w, http.StatusBadRequest, "invalid_request")
 		return
 	}

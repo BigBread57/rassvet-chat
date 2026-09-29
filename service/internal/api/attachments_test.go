@@ -22,6 +22,19 @@ type hookedReader struct {
 	before func()
 }
 
+func TestValidAttachmentName(t *testing.T) {
+	for _, name := range []string{"photo.jpg", "файл.txt"} {
+		if !validAttachmentName(name) {
+			t.Fatalf("rejected %q", name)
+		}
+	}
+	for _, name := range []string{"", ".", "..", "../secret", `..\secret`, "bad\nname"} {
+		if validAttachmentName(name) {
+			t.Fatalf("accepted %q", name)
+		}
+	}
+}
+
 func (r *hookedReader) Read(p []byte) (int, error) {
 	if r.before != nil {
 		before := r.before

@@ -12,6 +12,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
+import androidx.core.view.WindowCompat
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
@@ -36,7 +37,6 @@ import android.os.Handler
 import android.text.InputType
 import android.view.WindowManager
 import android.view.Gravity
-import android.view.WindowInsetsController
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
@@ -281,12 +281,18 @@ class MainActivity : ComponentActivity() {
         pendingAttachmentRoom = null
         pendingAttachmentUri = null
         showRoom(room.first, room.second)
-        val rawName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { cursor: Cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null } ?: "file"
-        val name = rawName.substringAfterLast('/').substringAfterLast('\\')
-            .filterNot { it == '\u0000' || it == '\r' || it == '\n' }.take(200)
-            .let { if (it.isBlank() || it == "." || it == "..") "file" else it }
-        val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+        val metadata = runCatching {
+            val rawName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor: Cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null } ?: "file"
+            val name = rawName.substringAfterLast('/').substringAfterLast('\\')
+                .filterNot { it == '\u0000' || it == '\r' || it == '\n' }.take(200)
+                .let { if (it.isBlank() || it == "." || it == "..") "file" else it }
+            name to (contentResolver.getType(uri) ?: "application/octet-stream")
+        }.getOrElse {
+            showError("Не удалось открыть файл: ${it.message}")
+            return
+        }
+        val (name, mimeType) = metadata
         val attachmentID = Uuid7.new()
         runNetwork({
             val file = File.createTempFile("attachment-", ".tmp", cacheDir)
@@ -689,7 +695,9 @@ class MainActivity : ComponentActivity() {
                 val room = JSONObject(client.post("/v1/admin/rooms", JSONObject().put("name", roomName)))
                 val id = room.getString("id")
                 val all = grants.toMutableMap()
-                all.putIfAbsent(client.userID(), "Вы" to roomRights(true, true, true, true))
+                if (client.userID() !in all) {
+                    all[client.userID()] = "Вы" to roomRights(true, true, true, true)
+                }
                 val failures = mutableListOf<String>()
                 all.forEach { (user, entry) ->
                     runCatching { client.put("/v1/admin/rooms/$id/members/$user", entry.second) }
@@ -1804,10 +1812,11 @@ class MainActivity : ComponentActivity() {
 
     private fun applySystemBars() {
         window.statusBarColor = screenColor
-        window.navigationBarColor = screenColor
-        val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
-            WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-        window.insetsController?.setSystemBarsAppearance(if (darkTheme) 0 else mask, mask)
+        window.navigationBarColor = if (!darkTheme && Build.VERSION.SDK_INT < 26) Color.BLACK else screenColor
+        WindowCompat.getInsetsController(window, root).apply {
+            isAppearanceLightStatusBars = !darkTheme
+            isAppearanceLightNavigationBars = !darkTheme
+        }
     }
 
     private fun themeSelector() {

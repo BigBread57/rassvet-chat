@@ -472,7 +472,7 @@ func applyPeerPayload(tx *sql.Tx, kind string, raw []byte, storageDir string) er
 			p.ID, p.RoomID, p.ActorID, p.CreatedAt)
 	case "attachment":
 		hash, decodeErr := hex.DecodeString(p.SHA256)
-		if !validUUID(p.ID) || !validUUID(p.RoomID) || !validUUID(p.UserID) || p.Name == "" || p.MimeType == "" || p.Size < 0 || p.Size > absoluteMaxAttachmentBytes || decodeErr != nil || len(hash) != 32 || p.SentAt < 1 || p.ExpiresAt <= p.SentAt {
+		if !validUUID(p.ID) || !validUUID(p.RoomID) || !validUUID(p.UserID) || !validAttachmentName(p.Name) || p.MimeType == "" || p.Size < 0 || p.Size > absoluteMaxAttachmentBytes || decodeErr != nil || len(hash) != 32 || p.SentAt < 1 || p.ExpiresAt <= p.SentAt {
 			return errInvalidPeerEvent
 		}
 		if p.ExpiresAt <= time.Now().Unix() {
